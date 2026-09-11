@@ -18,8 +18,6 @@ on:
 
 env:
   CONFIGURATION: ${{ github.event.inputs.configuration || 'Release' }}
-  # The solution only defines "Any CPU" configurations. Do NOT use x86/x64.
-  PLATFORM: 'Any CPU'
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
 
@@ -39,9 +37,8 @@ jobs:
 
       # ------------------------------------------------------------
       # 2. Install .NET Framework 4.7.2 Developer Pack
-      #    The project targets v4.7.2. Without this, MSBuild fails with
-      #    "The reference assemblies for .NETFramework,Version=v4.7.2
-      #    were not found."
+      #    The csproj targets v4.7.2. Without this, MSBuild fails
+      #    with MSB3644 "reference assemblies not found".
       # ------------------------------------------------------------
       - name: Install .NET Framework 4.7.2 Developer Pack
         shell: pwsh
@@ -49,7 +46,7 @@ jobs:
           choco install netfx-4.7.2-devpack --yes --no-progress
 
       # ------------------------------------------------------------
-      # 3. Setup MSBuild (required for .NET Framework / WinForms)
+      # 3. Setup MSBuild
       # ------------------------------------------------------------
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -61,100 +58,127 @@ jobs:
         uses: NuGet/setup-nuget@v2
 
       # ------------------------------------------------------------
-      # 5. Locate the solution file
-      #    It lives at LeagueBot/Sources/LeagueBot.sln
+      # 5. Locate LeagueBot.csproj directly
+      #    We deliberately DO NOT build LeagueBot.sln because it
+      #    references two projects that are not present in the repo:
+      #      - ColorPicker\ColorViewer.csproj
+      #      - LeagueBot.Updater\LeagueBot.Updater.csproj
+      #    Building the csproj directly sidesteps those missing refs.
       # ------------------------------------------------------------
-      - name: Locate solution file
-        id: find_sln
+      - name: Locate LeagueBot.csproj
+        id: find_csproj
         shell: pwsh
         run: |
-          $sln = Get-ChildItem -Path . -Recurse -Filter LeagueBot.sln |
-                 Where-Object { $_.FullName -notmatch '\\(bin|obj|packages)\\' } |
-                 Select-Object -First 1
-          if (-not $sln) {
-              Write-Error "LeagueBot.sln not found."
+          $csproj = Get-ChildItem -Path . -Recurse -Filter LeagueBot.csproj |
+                    Where-Object { $_.FullName -notmatch '\\(obj|bin|packages)\\' } |
+                    Select-Object -First 1
+          if (-not $csproj) {
+              Write-Error "LeagueBot.csproj not found."
               exit 1
           }
-          Write-Host "Found solution: $($sln.FullName)"
-          "sln_path=$($sln.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "sln_dir=$($sln.DirectoryName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Found csproj: $($csproj.FullName)"
+          "csproj_path=$($csproj.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "csproj_dir=$($csproj.DirectoryName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       # ------------------------------------------------------------
-      # 6. Cache NuGet packages
-      # ------------------------------------------------------------
-      - name: Cache NuGet packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.nuget/packages
-          key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.config', '**/*.csproj', '**/*.sln') }}
-          restore-keys: |
-            ${{ runner.os }}-nuget-
-
-      # ------------------------------------------------------------
-      # 7. Restore NuGet packages
-      #    The project references packages via ..\packages\ paths.
-      #    If a packages.config is missing, nuget restore will still
-      #    create the packages folder based on .csproj <Reference> hints.
+      # 6. Restore NuGet packages for LeagueBot.csproj
+      #    If packages.config exists, nuget restore reads it.
+      #    Otherwise, we fall back to adding Newtonsoft.Json and
+      #    the other needed packages explicitly.
       # ------------------------------------------------------------
       - name: Restore NuGet packages
         shell: pwsh
-        working-directory: ${{ steps.find_sln.outputs.sln_dir }}
+        working-directory: ${{ steps.find_csproj.outputs.csproj_dir }}
         run: |
-          $sln = "${{ steps.find_sln.outputs.sln_path }}"
-          Write-Host "Restoring packages for $sln"
-          nuget restore "$sln" -NonInteractive -Verbosity detailed
+          $csproj = "${{ steps.find_csproj.outputs.csproj_path }}"
+          $pkgConfig = Join-Path "${{ steps.find_csproj.outputs.csproj_dir }}" "packages.config"
+
+          if (Test-Path $pkgConfig) {
+              Write-Host "Found packages.config — restoring from it."
+              nuget restore $pkgConfig -PackagesDirectory ..\..\packages -NonInteractive -Verbosity detailed
+          } else {
+              Write-Host "No packages.config — restoring csproj directly."
+              nuget restore $csproj -NonInteractive -Verbosity detailed
+          }
+
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # ------------------------------------------------------------
-      # 8. Build solution
-      #    Platform MUST be "Any CPU" — the solution does not define
-      #    x86 or x64 configurations.
+      # 7. Ensure Newtonsoft.Json is present
+      #    The project references Newtonsoft.Json via HintPath
+      #    (..\..\packages\Newtonsoft.Json.*\lib\net45\...).
+      #    If it's missing, install it explicitly.
       # ------------------------------------------------------------
-      - name: Build solution
+      - name: Ensure Newtonsoft.Json is available
         shell: pwsh
-        working-directory: ${{ steps.find_sln.outputs.sln_dir }}
+        working-directory: ${{ steps.find_csproj.outputs.csproj_dir }}
         run: |
-          $sln = "${{ steps.find_sln.outputs.sln_path }}"
+          $packagesRoot = Resolve-Path "..\..\packages" -ErrorAction SilentlyContinue
+          if (-not $packagesRoot) {
+              $packagesRoot = Join-Path (Resolve-Path "..\..").Path "packages"
+              New-Item -ItemType Directory -Path $packagesRoot -Force | Out-Null
+          }
+          $existing = Get-ChildItem -Path $packagesRoot -Filter "Newtonsoft.Json*" -Directory -ErrorAction SilentlyContinue
+          if (-not $existing) {
+              Write-Host "Newtonsoft.Json not found in packages. Installing 12.0.3..."
+              nuget install Newtonsoft.Json -Version 12.0.3 -OutputDirectory $packagesRoot -NonInteractive
+          } else {
+              Write-Host "Newtonsoft.Json already present: $($existing.Name)"
+          }
+
+      # ------------------------------------------------------------
+      # 8. Build LeagueBot.csproj directly
+      #    - /p:AllowUnsafeBlocks=true  → required by FastBitmap.cs
+      #    - /p:Platform=AnyCPU          → matches the csproj
+      #    - /p:TargetFrameworkVersion=v4.7.2 → pinned explicitly
+      # ------------------------------------------------------------
+      - name: Build LeagueBot.csproj
+        shell: pwsh
+        working-directory: ${{ steps.find_csproj.outputs.csproj_dir }}
+        run: |
+          $csproj = "${{ steps.find_csproj.outputs.csproj_path }}"
           $config = "${{ env.CONFIGURATION }}"
-          $platform = "${{ env.PLATFORM }}"
-          Write-Host "Building $sln | Config: $config | Platform: $platform"
-          msbuild "$sln" `
+          Write-Host "Building $csproj | Config: $config"
+
+          msbuild "$csproj" `
             /p:Configuration=$config `
-            /p:Platform="$platform" `
+            /p:Platform=AnyCPU `
+            /p:TargetFrameworkVersion=v4.7.2 `
+            /p:AllowUnsafeBlocks=true `
+            /p:RestorePackages=false `
             /m `
             /verbosity:minimal `
             /nologo `
             /consoleloggerparameters:Summary
+
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # ------------------------------------------------------------
-      # 9. Verify that a build output exists
-      #    The .csproj sets OutputPath to ..\..\..\Binaries\
-      #    so the exe lands in the repository-root Binaries folder.
+      # 9. Verify a build output exists
       # ------------------------------------------------------------
       - name: Verify build output
         shell: pwsh
         run: |
-          $exe = Get-ChildItem -Path . -Recurse -Include *.exe |
+          $exe = Get-ChildItem -Path . -Recurse -Include LeagueBot.exe,*.dll |
                  Where-Object { $_.FullName -notmatch "\\obj\\" -and
-                                $_.FullName -notmatch "\\packages\\" }
+                                $_.FullName -notmatch "\\packages\\" -and
+                                $_.FullName -match "\\${{ env.CONFIGURATION }}\\" }
           if (-not $exe) {
-              Write-Error "No executable produced. Check the build logs above."
+              Write-Error "No build output produced."
               exit 1
           }
           $exe | ForEach-Object { Write-Host "Built: $($_.FullName)" }
 
       # ------------------------------------------------------------
       # 10. Upload artifacts
-      #     The project outputs to the Binaries folder.
       # ------------------------------------------------------------
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LeagueBot-${{ env.CONFIGURATION }}-AnyCPU
+          name: LeagueBot-${{ env.CONFIGURATION }}
           path: |
-            Binaries/**
             **/bin/${{ env.CONFIGURATION }}/**
+            Binaries/**
             !**/obj/**
             !**/packages/**
           if-no-files-found: error
