@@ -1,0 +1,161 @@
+name: Build League of Legends Bot
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: 'Build configuration'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+
+env:
+  CONFIGURATION: ${{ github.event.inputs.configuration || 'Release' }}
+  # The solution only defines "Any CPU" configurations. Do NOT use x86/x64.
+  PLATFORM: 'Any CPU'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  build:
+    name: Build LeagueBot
+    runs-on: windows-latest
+
+    steps:
+      # ------------------------------------------------------------
+      # 1. Checkout
+      # ------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ------------------------------------------------------------
+      # 2. Install .NET Framework 4.7.2 Developer Pack
+      #    The project targets v4.7.2. Without this, MSBuild fails with
+      #    "The reference assemblies for .NETFramework,Version=v4.7.2
+      #    were not found."
+      # ------------------------------------------------------------
+      - name: Install .NET Framework 4.7.2 Developer Pack
+        shell: pwsh
+        run: |
+          choco install netfx-4.7.2-devpack --yes --no-progress
+
+      # ------------------------------------------------------------
+      # 3. Setup MSBuild (required for .NET Framework / WinForms)
+      # ------------------------------------------------------------
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # ------------------------------------------------------------
+      # 4. Setup NuGet
+      # ------------------------------------------------------------
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      # ------------------------------------------------------------
+      # 5. Locate the solution file
+      #    It lives at LeagueBot/Sources/LeagueBot.sln
+      # ------------------------------------------------------------
+      - name: Locate solution file
+        id: find_sln
+        shell: pwsh
+        run: |
+          $sln = Get-ChildItem -Path . -Recurse -Filter LeagueBot.sln |
+                 Where-Object { $_.FullName -notmatch '\\(bin|obj|packages)\\' } |
+                 Select-Object -First 1
+          if (-not $sln) {
+              Write-Error "LeagueBot.sln not found."
+              exit 1
+          }
+          Write-Host "Found solution: $($sln.FullName)"
+          "sln_path=$($sln.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sln_dir=$($sln.DirectoryName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # ------------------------------------------------------------
+      # 6. Cache NuGet packages
+      # ------------------------------------------------------------
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.config', '**/*.csproj', '**/*.sln') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      # ------------------------------------------------------------
+      # 7. Restore NuGet packages
+      #    The project references packages via ..\packages\ paths.
+      #    If a packages.config is missing, nuget restore will still
+      #    create the packages folder based on .csproj <Reference> hints.
+      # ------------------------------------------------------------
+      - name: Restore NuGet packages
+        shell: pwsh
+        working-directory: ${{ steps.find_sln.outputs.sln_dir }}
+        run: |
+          $sln = "${{ steps.find_sln.outputs.sln_path }}"
+          Write-Host "Restoring packages for $sln"
+          nuget restore "$sln" -NonInteractive -Verbosity detailed
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # ------------------------------------------------------------
+      # 8. Build solution
+      #    Platform MUST be "Any CPU" — the solution does not define
+      #    x86 or x64 configurations.
+      # ------------------------------------------------------------
+      - name: Build solution
+        shell: pwsh
+        working-directory: ${{ steps.find_sln.outputs.sln_dir }}
+        run: |
+          $sln = "${{ steps.find_sln.outputs.sln_path }}"
+          $config = "${{ env.CONFIGURATION }}"
+          $platform = "${{ env.PLATFORM }}"
+          Write-Host "Building $sln | Config: $config | Platform: $platform"
+          msbuild "$sln" `
+            /p:Configuration=$config `
+            /p:Platform="$platform" `
+            /m `
+            /verbosity:minimal `
+            /nologo `
+            /consoleloggerparameters:Summary
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # ------------------------------------------------------------
+      # 9. Verify that a build output exists
+      #    The .csproj sets OutputPath to ..\..\..\Binaries\
+      #    so the exe lands in the repository-root Binaries folder.
+      # ------------------------------------------------------------
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path . -Recurse -Include *.exe |
+                 Where-Object { $_.FullName -notmatch "\\obj\\" -and
+                                $_.FullName -notmatch "\\packages\\" }
+          if (-not $exe) {
+              Write-Error "No executable produced. Check the build logs above."
+              exit 1
+          }
+          $exe | ForEach-Object { Write-Host "Built: $($_.FullName)" }
+
+      # ------------------------------------------------------------
+      # 10. Upload artifacts
+      #     The project outputs to the Binaries folder.
+      # ------------------------------------------------------------
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeagueBot-${{ env.CONFIGURATION }}-AnyCPU
+          path: |
+            Binaries/**
+            **/bin/${{ env.CONFIGURATION }}/**
+            !**/obj/**
+            !**/packages/**
+          if-no-files-found: error
+          retention-days: 30
